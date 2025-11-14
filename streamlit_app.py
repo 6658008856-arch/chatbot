@@ -1,56 +1,142 @@
 import streamlit as st
 from openai import OpenAI
+import hashlib
+import tempfile
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.document_loaders import PyPDFLoader, TextLoader
 
-# Show title and description.
-st.title("💬 Chatbot")
+# ---------------------------
+# AUTHENTICATION
+# ---------------------------
+def check_password():
+    """Simple username/password login based on Streamlit session state."""
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if st.session_state.authenticated:
+        return True
+
+    st.title("🔐 Login Required")
+
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
+
+    if st.button("Login"):
+        if (
+            username == st.secrets["auth"]["username"]
+            and hashlib.sha256(password.encode()).hexdigest()
+            == st.secrets["auth"]["password_hash"]
+        ):
+            st.session_state.authenticated = True
+            return True
+        else:
+            st.error("Invalid username or password.")
+
+    return False
+
+if not check_password():
+    st.stop()
+
+# ---------------------------
+# INITIALIZE CLIENT
+# ---------------------------
+client = OpenAI(api_key=st.secrets["openai"]["api_key"])
+
+# ---------------------------
+# APP LAYOUT
+# ---------------------------
+st.title("💬 Chatbot with Local Knowledge (RAG)")
+
 st.write(
-    "This is a simple chatbot that uses OpenAI's GPT-3.5 model to generate responses. "
-    "To use this app, you need to provide an OpenAI API key, which you can get [here](https://platform.openai.com/account/api-keys). "
-    "You can also learn how to build this app step by step by [following our tutorial](https://docs.streamlit.io/develop/tutorials/llms/build-conversational-apps)."
+    "This chatbot uses GPT-4.1 + locally uploaded knowledge files. "
+    "Upload PDFs or text files, and the bot will use them to answer your questions."
 )
 
-# Ask user for their OpenAI API key via `st.text_input`.
-# Alternatively, you can store the API key in `./.streamlit/secrets.toml` and access it
-# via `st.secrets`, see https://docs.streamlit.io/develop/concepts/connections/secrets-management
-openai_api_key = st.text_input("OpenAI API Key", type="password")
-if not openai_api_key:
-    st.info("Please add your OpenAI API key to continue.", icon="🗝️")
-else:
+# ---------------------------
+# FILE UPLOAD + VECTOR STORE
+# ---------------------------
+if "vectorstore" not in st.session_state:
+    st.session_state.vectorstore = None
 
-    # Create an OpenAI client.
-    client = OpenAI(api_key=openai_api_key)
+uploaded_files = st.file_uploader(
+    "Upload knowledge files (PDF or text)", type=["pdf", "txt", "md"], accept_multiple_files=True
+)
 
-    # Create a session state variable to store the chat messages. This ensures that the
-    # messages persist across reruns.
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
+if uploaded_files:
+    docs = []
 
-    # Display the existing chat messages via `st.chat_message`.
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    for uploaded in uploaded_files:
+        temp_path = tempfile.mktemp()
+        with open(temp_path, "wb") as f:
+            f.write(uploaded.read())
 
-    # Create a chat input field to allow the user to enter a message. This will display
-    # automatically at the bottom of the page.
-    if prompt := st.chat_input("What is up?"):
+        if uploaded.name.endswith(".pdf"):
+            loader = PyPDFLoader(temp_path)
+        else:
+            loader = TextLoader(temp_path)
 
-        # Store and display the current prompt.
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        docs.extend(loader.load())
 
-        # Generate a response using the OpenAI API.
-        stream = client.chat.completions.create(
-            model="gpt-4.1",
-            messages=[
-                {"role": m["role"], "content": m["content"]}
-                for m in st.session_state.messages
-            ],
-            stream=True,
-        )
+    # Chunking
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+    chunks = splitter.split_documents(docs)
 
-        # Stream the response to the chat using `st.write_stream`, then store it in 
-        # session state.
-        with st.chat_message("assistant"):
-            response = st.write_stream(stream)
-        st.session_state.messages.append({"role": "assistant", "content": response})
+    # Embeddings
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=st.secrets["openai"]["api_key"])
+
+    # Build vector store
+    st.session_state.vectorstore = FAISS.from_documents(chunks, embeddings)
+    st.success(f"Indexed {len(chunks)} knowledge chunks!")
+
+# ---------------------------
+# CHAT STATE
+# ---------------------------
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# Display chat history
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# ---------------------------
+# CHAT INPUT
+# ---------------------------
+query = st.chat_input("Ask something…")
+
+if query:
+    st.session_state.messages.append({"role": "user", "content": query})
+
+    with st.chat_message("user"):
+        st.markdown(query)
+
+    # Retrieve local context
+    retrieved_text = ""
+    if st.session_state.vectorstore:
+        results = st.session_state.vectorstore.similarity_search(query, k=4)
+        retrieved_text = "\n\n".join([d.page_content for d in results])
+
+    system_instruction = (
+        "You are an AI assistant. Use the provided local knowledge if relevant. "
+        "If the knowledge does not help, fall back to general reasoning.\n\n"
+        f"Local knowledge:\n{retrieved_text}"
+    )
+
+    # Generate response
+    stream = client.chat.completions.create(
+        model="gpt-4.1",
+        messages=[
+            {"role": "system", "content": system_instruction},
+            *st.session_state.messages,
+        ],
+        stream=True,
+    )
+
+    # Stream the reply
+    with st.chat_message("assistant"):
+        response_text = st.write_stream(stream)
+
+    # Save history
+    st.session_state.messages.append({"role": "assistant", "content": response_text})
