@@ -2,20 +2,18 @@ import streamlit as st
 from openai import OpenAI
 import hashlib
 import tempfile
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import OpenAIEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain.document_loaders import PyPDFLoader, TextLoader
+import faiss
+import numpy as np
+from pypdf import PdfReader
 
-# ---------------------------
-# AUTHENTICATION
-# ---------------------------
+# =================================
+# LOGIN PROTECTION
+# =================================
 def check_password():
-    """Simple username/password login based on Streamlit session state."""
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
+    if "auth" not in st.session_state:
+        st.session_state.auth = False
 
-    if st.session_state.authenticated:
+    if st.session_state.auth:
         return True
 
     st.title("🔐 Login Required")
@@ -29,114 +27,91 @@ def check_password():
             and hashlib.sha256(password.encode()).hexdigest()
             == st.secrets["auth"]["password_hash"]
         ):
-            st.session_state.authenticated = True
+            st.session_state.auth = True
             return True
-        else:
-            st.error("Invalid username or password.")
+        st.error("Invalid credentials")
 
     return False
+
 
 if not check_password():
     st.stop()
 
-# ---------------------------
-# INITIALIZE CLIENT
-# ---------------------------
+# =================================
+# OPENAI CLIENT
+# =================================
 client = OpenAI(api_key=st.secrets["openai"]["api_key"])
 
-# ---------------------------
-# APP LAYOUT
-# ---------------------------
-st.title("💬 Chatbot with Local Knowledge (RAG)")
+# =================================
+# TEXT SPLITTING (NO LANGCHAIN)
+# =================================
+def split_text(text, chunk_size=1000, overlap=200):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(len(text), start + chunk_size)
+        chunks.append(text[start:end])
+        start = end - overlap
+    return chunks
 
-st.write(
-    "This chatbot uses GPT-4.1 + locally uploaded knowledge files. "
-    "Upload PDFs or text files, and the bot will use them to answer your questions."
-)
+# =================================
+# EMBEDDING WITHOUT LANGCHAIN
+# =================================
+def embed_texts(text_list):
+    result = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=text_list
+    )
+    return np.array([d.embedding for d in result.data]).astype("float32")
 
-# ---------------------------
-# FILE UPLOAD + VECTOR STORE
-# ---------------------------
-if "vectorstore" not in st.session_state:
-    st.session_state.vectorstore = None
+# =================================
+# PDF READING
+# =================================
+def read_pdf(path):
+    reader = PdfReader(path)
+    return "\n".join([page.extract_text() or "" for page in reader.pages])
+
+# =================================
+# VECTOR STORE (FAISS)
+# =================================
+if "faiss_index" not in st.session_state:
+    st.session_state.faiss_index = None
+    st.session_state.chunks = []
+
+st.title("💬 Chatbot with Local Knowledge (No LangChain)")
 
 uploaded_files = st.file_uploader(
-    "Upload knowledge files (PDF or text)", type=["pdf", "txt", "md"], accept_multiple_files=True
+    "Upload PDFs or TXT files for local knowledge",
+    accept_multiple_files=True,
+    type=["pdf", "txt", "md"]
 )
 
 if uploaded_files:
-    docs = []
+    all_chunks = []
 
     for uploaded in uploaded_files:
         temp_path = tempfile.mktemp()
+
         with open(temp_path, "wb") as f:
             f.write(uploaded.read())
 
         if uploaded.name.endswith(".pdf"):
-            loader = PyPDFLoader(temp_path)
+            text = read_pdf(temp_path)
         else:
-            loader = TextLoader(temp_path)
+            text = open(temp_path, "r", errors="ignore").read()
 
-        docs.extend(loader.load())
+        chunks = split_text(text)
+        all_chunks.extend(chunks)
 
-    # Chunking
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
-    chunks = splitter.split_documents(docs)
+    embeds = embed_texts(all_chunks)
 
-    # Embeddings
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-large", api_key=st.secrets["openai"]["api_key"])
+    dim = embeds.shape[1]
+    index = faiss.IndexFlatL2(dim)
+    index.add(embeds)
 
-    # Build vector store
-    st.session_state.vectorstore = FAISS.from_documents(chunks, embeddings)
-    st.success(f"Indexed {len(chunks)} knowledge chunks!")
+    st.session_state.faiss_index = index
+    st.session_state.chunks = all_chunks
 
-# ---------------------------
-# CHAT STATE
-# ---------------------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+    st.success(f"Indexed {len(all_chunks)} knowledge chunks!")
 
-# Display chat history
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-
-# ---------------------------
-# CHAT INPUT
-# ---------------------------
-query = st.chat_input("Ask something…")
-
-if query:
-    st.session_state.messages.append({"role": "user", "content": query})
-
-    with st.chat_message("user"):
-        st.markdown(query)
-
-    # Retrieve local context
-    retrieved_text = ""
-    if st.session_state.vectorstore:
-        results = st.session_state.vectorstore.similarity_search(query, k=4)
-        retrieved_text = "\n\n".join([d.page_content for d in results])
-
-    system_instruction = (
-        "You are an AI assistant. Use the provided local knowledge if relevant. "
-        "If the knowledge does not help, fall back to general reasoning.\n\n"
-        f"Local knowledge:\n{retrieved_text}"
-    )
-
-    # Generate response
-    stream = client.chat.completions.create(
-        model="gpt-4.1",
-        messages=[
-            {"role": "system", "content": system_instruction},
-            *st.session_state.messages,
-        ],
-        stream=True,
-    )
-
-    # Stream the reply
-    with st.chat_message("assistant"):
-        response_text = st.write_stream(stream)
-
-    # Save history
-    st.session_state.messages.append({"role": "assistant", "content": response_text})
+# ====
